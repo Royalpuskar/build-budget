@@ -1,12 +1,48 @@
-
-function obj(v){if(!v||typeof v!=='object'||Array.isArray(v))throw Error('Expected an object');return v;}
-function arr(v,label='array'){if(!Array.isArray(v)||v.length>500)throw Error(label+' must be an array with at most 500 items');return v;}
-function str(v){if(typeof v!=='string'||!v.trim()||v.length>100000)throw Error('Expected nonempty text (max 100000 characters)');return v;}
-function num(v,label='number',min=-1e12){if(typeof v!=='number'||!Number.isFinite(v)||v<min||Math.abs(v)>1e12)throw Error(label+' must be a finite number in range');return v;}
-function bool(v){if(typeof v!=='boolean')throw Error('Expected a boolean');return v;}
-function date(v){if(typeof v!=='string'||!/^\d{4}-\d{2}-\d{2}$/.test(v))throw Error('Expected YYYY-MM-DD');const t=Date.parse(v+'T00:00:00Z');if(!Number.isFinite(t)||new Date(t).toISOString().slice(0,10)!==v)throw Error('Invalid calendar date');return t;}
-export function run(x){obj(x);if(JSON.stringify(x).length>200000)throw Error('Input exceeds 200 KB limit');
-
-num(x.budget,'budget',0);num(x.assetLimit,'asset limit',0);const index=a=>{const m=new Map();for(const f of arr(a,'assets')){str(f.path);num(f.bytes,'bytes',0);if(m.has(f.path))throw Error('Duplicate path');m.set(f.path,f.bytes);}return m;};const a=index(x.before),b=index(x.after);const total=[...b.values()].reduce((p,c)=>p+c,0);const rows=[...new Set([...a.keys(),...b.keys()])].sort().map(path=>({path,before:a.get(path)||0,after:b.get(path)||0,delta:(b.get(path)||0)-(a.get(path)||0),overLimit:(b.get(path)||0)>x.assetLimit}));return {metrics:{totalBytes:total,totalBudget:x.budget,passed:total<=x.budget&&!rows.some(r=>r.overLimit)},rows};
-
+function object(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw Error('Expected an object');
+}
+function bytes(value) {
+  if (!Number.isSafeInteger(value) || value < 0 || value > 1e12) throw Error('Byte counts and budgets must be integers from 0 to 1e12');
+  return value;
+}
+function index(assets) {
+  if (!Array.isArray(assets) || assets.length > 500) throw Error('assets must be an array of at most 500 items');
+  const result = new Map();
+  for (const asset of assets) {
+    object(asset);
+    if (typeof asset.path !== 'string' || !asset.path.trim() || asset.path.length > 100000) throw Error('Expected a nonempty path');
+    if (result.has(asset.path)) throw Error('Duplicate path');
+    result.set(asset.path, bytes(asset.bytes));
+  }
+  return result;
+}
+export function run(input) {
+  object(input);
+  if (JSON.stringify(input).length > 200000) throw Error('Input exceeds 200000 serialized characters');
+  const budget = bytes(input.budget), assetLimit = bytes(input.assetLimit);
+  const growthBudget = Object.hasOwn(input, 'growthBudget') ? bytes(input.growthBudget) : null;
+  const before = index(input.before), after = index(input.after);
+  const totals = {added:0, removed:0, grown:0, shrunk:0};
+  const rows = [...new Set([...before.keys(), ...after.keys()])].sort().map(path => {
+    const a = before.get(path) ?? 0, b = after.get(path) ?? 0, delta = b - a;
+    const status = !before.has(path) ? 'added' : !after.has(path) ? 'removed' : delta > 0 ? 'grown' : delta < 0 ? 'shrunk' : 'unchanged';
+    if (status === 'added') totals.added += b;
+    if (status === 'removed') totals.removed += a;
+    if (status === 'grown') totals.grown += delta;
+    if (status === 'shrunk') totals.shrunk -= delta;
+    return {path, before:a, after:b, delta, status, overLimit:after.has(path) && b > assetLimit};
+  });
+  const previousBytes = [...before.values()].reduce((a,b) => a+b, 0);
+  const totalBytes = [...after.values()].reduce((a,b) => a+b, 0);
+  const positiveGrowthBytes = totals.added + totals.grown;
+  const violations = [];
+  if (totalBytes > budget) violations.push({kind:'total-budget',actual:totalBytes,limit:budget,excess:totalBytes-budget});
+  if (growthBudget !== null && positiveGrowthBytes > growthBudget)
+    violations.push({kind:'growth-budget',actual:positiveGrowthBytes,limit:growthBudget,excess:positiveGrowthBytes-growthBudget});
+  for (const row of rows) if (row.overLimit)
+    violations.push({kind:'asset-budget',path:row.path,actual:row.after,limit:assetLimit,excess:row.after-assetLimit});
+  return {metrics:{totalBytes,totalBudget:budget,passed:violations.length===0,previousBytes,
+    netChangeBytes:totalBytes-previousBytes,positiveGrowthBytes},rows,
+    accounting:{addedBytes:totals.added,removedBytes:totals.removed,grownBytes:totals.grown,shrunkBytes:totals.shrunk},
+    policy:{growthBudget},violations};
 }
